@@ -1,0 +1,41 @@
+representation: tsdf
+
+data:
+  root: data/
+  processed_dir: data/processed/tsdf/
+  splits_dir: data/splits/
+  augment: true
+
+model:
+  encoder_dim: 256
+  codebook_size: 512
+  decoder: tsdf
+
+training:
+  batch_size: 4               # TITAN X 12GB constraint
+  num_steps: 50000
+  lr: 1.0e-4
+  lr_schedule: cosine
+  warmup_steps: 1000
+  mixed_precision: true
+  grad_checkpoint: false      # enable if OOM
+  save_every: 5000
+  checkpoint_dir: checkpoints/tsdf/
+
+loss:
+  reconstruction: l1
+  vq_weight: 1.0
+  commitment_weight: 0.25
+
+evaluation:
+  metrics: [chamfer, iou, fscore]
+  fscore_threshold: 0.01
+
+diffusion:
+  latent_dir: data/latents/tsdf/
+  checkpoint_dir: checkpoints/tsdf_diffusion/
+  timesteps: 1000
+  num_steps: 100000
+  lr: 2.0e-4
+  save_every: 10000
+  ddim_steps: 50

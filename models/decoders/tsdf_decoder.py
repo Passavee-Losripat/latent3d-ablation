@@ -1,0 +1,52 @@
+"""TSDF decoder: maps (B, 256, 4, 4, 4) latents to (B, 1, 32, 32, 32) TSDF volumes.
+
+Output values are in [-1.0, 1.0] via tanh, matching the normalized TSDF range.
+
+Layer shapes:
+  Input   (B, 256,  4,  4,  4)
+  Block 0 (B, 128,  8,  8,  8)  — ConvTranspose3d stride 2
+  Block 1 (B,  64, 16, 16, 16)  — ConvTranspose3d stride 2
+  Block 2 (B,  32, 32, 32, 32)  — ConvTranspose3d stride 2
+  Head    (B,   1, 32, 32, 32)  — Conv3d + tanh
+"""
+
+import torch
+import torch.nn as nn
+
+
+class TSDFDecoder(nn.Module):
+    """3D transposed-conv decoder for TSDF reconstruction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.block0 = _UpBlock(256, 128)
+        self.block1 = _UpBlock(128, 64)
+        self.block2 = _UpBlock(64, 32)
+
+        self.head = nn.Sequential(
+            nn.Conv3d(32, 1, kernel_size=3, stride=1, padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
+        """z_q: (B, 256, 4, 4, 4) → (B, 1, 32, 32, 32)"""
+        x = self.block0(z_q)
+        x = self.block1(x)
+        x = self.block2(x)
+        return self.head(x)
+
+
+class _UpBlock(nn.Module):
+    """ConvTranspose3d (stride=2, kernel=4) → GroupNorm → SiLU."""
+
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ConvTranspose3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(32, out_ch), num_channels=out_ch),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
