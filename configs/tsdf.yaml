@@ -15,7 +15,7 @@ model:
   resolution: 64             # voxel resolution; drives encoder depth
 
 training:
-  batch_size: 4               # TITAN X 12GB constraint
+  batch_size: 16              # ~4.6GB peak at 64³ — fits TITAN X 12GB
   num_steps: 50000
   lr: 1.0e-4
   lr_schedule: cosine
