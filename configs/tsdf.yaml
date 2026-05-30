@@ -2,14 +2,17 @@ representation: tsdf
 
 data:
   root: data/
-  processed_dir: data/processed/tsdf/
+  processed_dir: data/processed/tsdf_64/
+  voxel_dir: data/processed/voxel_64/
   splits_dir: data/splits/
   augment: true
 
 model:
   encoder_dim: 256
   codebook_size: 512
+  latent_channels: 64        # 256→64 projection; compact latent for diffusion
   decoder: tsdf
+  resolution: 64             # voxel resolution; drives encoder depth
 
 training:
   batch_size: 4               # TITAN X 12GB constraint
@@ -24,15 +27,20 @@ training:
 
 loss:
   reconstruction: l1
-  vq_weight: 1.0
+  surface_weight: 10.0        # near-surface voxels weighted this much more
+  surface_threshold: 0.3      # |tsdf| < this is treated as near-surface
+  vq_weight: 0.0              # EMA codebook needs no explicit codebook loss term
   commitment_weight: 0.25
 
 evaluation:
-  metrics: [chamfer, iou, fscore]
+  metrics: [chamfer, iou, fscore, mmd, coverage, jsd]
   fscore_threshold: 0.01
+  n_generate: 100
+  n_points: 2048
 
 diffusion:
   latent_dir: data/latents/tsdf/
+  latent_stats_path: checkpoints/tsdf/latent_stats.npz
   checkpoint_dir: checkpoints/tsdf_diffusion/
   timesteps: 1000
   num_steps: 100000

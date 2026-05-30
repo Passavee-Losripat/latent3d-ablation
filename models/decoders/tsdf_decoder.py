@@ -1,13 +1,14 @@
-"""TSDF decoder: maps (B, 256, 4, 4, 4) latents to (B, 1, 32, 32, 32) TSDF volumes.
+"""TSDF decoder: maps (B, 256, 4, 4, 4) latents to (B, 1, 64, 64, 64) TSDF volumes.
 
 Output values are in [-1.0, 1.0] via tanh, matching the normalized TSDF range.
 
 Layer shapes:
   Input   (B, 256,  4,  4,  4)
-  Block 0 (B, 128,  8,  8,  8)  — ConvTranspose3d stride 2
-  Block 1 (B,  64, 16, 16, 16)  — ConvTranspose3d stride 2
-  Block 2 (B,  32, 32, 32, 32)  — ConvTranspose3d stride 2
-  Head    (B,   1, 32, 32, 32)  — Conv3d + tanh
+  Block 0 (B, 256,  8,  8,  8)  — ConvTranspose3d stride 2
+  Block 1 (B, 128, 16, 16, 16)  — ConvTranspose3d stride 2
+  Block 2 (B,  64, 32, 32, 32)  — ConvTranspose3d stride 2
+  Block 3 (B,  32, 64, 64, 64)  — ConvTranspose3d stride 2
+  Head    (B,   1, 64, 64, 64)  — Conv3d + tanh
 """
 
 import torch
@@ -15,14 +16,15 @@ import torch.nn as nn
 
 
 class TSDFDecoder(nn.Module):
-    """3D transposed-conv decoder for TSDF reconstruction."""
+    """3D transposed-conv decoder for TSDF reconstruction at 64³ resolution."""
 
     def __init__(self) -> None:
         super().__init__()
 
-        self.block0 = _UpBlock(256, 128)
-        self.block1 = _UpBlock(128, 64)
-        self.block2 = _UpBlock(64, 32)
+        self.block0 = _UpBlock(256, 256)   #  4³ →  8³
+        self.block1 = _UpBlock(256, 128)   #  8³ → 16³
+        self.block2 = _UpBlock(128, 64)    # 16³ → 32³
+        self.block3 = _UpBlock(64,  32)    # 32³ → 64³
 
         self.head = nn.Sequential(
             nn.Conv3d(32, 1, kernel_size=3, stride=1, padding=1),
@@ -30,10 +32,11 @@ class TSDFDecoder(nn.Module):
         )
 
     def forward(self, z_q: torch.Tensor) -> torch.Tensor:
-        """z_q: (B, 256, 4, 4, 4) → (B, 1, 32, 32, 32)"""
+        """z_q: (B, 256, 4, 4, 4) → (B, 1, 64, 64, 64)"""
         x = self.block0(z_q)
         x = self.block1(x)
         x = self.block2(x)
+        x = self.block3(x)
         return self.head(x)
 
 

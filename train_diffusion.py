@@ -1,9 +1,12 @@
 """Stage 2 training: latent diffusion on VQ-VAE compressed representations.
 
 Loads pre-saved latents from data/latents/{representation}/ (produced by
-train_vqvae.py --extract-latents) and trains a 3D U-Net with DDPM objective.
+train_vqvae.py) and trains a 3D U-Net with DDPM objective.
 
-At inference: DDIM sample → VQ-VAE decoder → marching cubes mesh.
+Latents are normalized to ~N(0,1) using stats saved by train_vqvae.py before
+being fed to the diffusion model. Denormalization is applied after sampling.
+
+At inference: DDIM sample → denormalize → VQ-VAE decoder → marching cubes mesh.
 
 Usage:
     python train_diffusion.py --config configs/tsdf.yaml [--vqvae_ckpt checkpoints/tsdf/best.pt]
@@ -17,7 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 import yaml
@@ -50,16 +53,20 @@ def load_config(path: str) -> SimpleNamespace:
 # Latent dataset
 # ---------------------------------------------------------------------------
 
-def load_latent_dataset(latent_dir: str | Path) -> TensorDataset:
-    """Load all .npy latent files from a directory into a TensorDataset."""
+def load_latents(latent_dir: str | Path) -> tuple[np.ndarray, list[Path]]:
+    """Load all .npy latent files from a directory; return array and file list."""
     latent_dir = Path(latent_dir)
     files = sorted(latent_dir.glob("*.npy"))
     if not files:
         raise RuntimeError(f"No latent .npy files found in {latent_dir}.")
-
     arrays = [np.load(str(f)) for f in files]
-    tensor = torch.from_numpy(np.stack(arrays, axis=0))  # (N, C, H, W, L)
-    return TensorDataset(tensor)
+    return np.stack(arrays, axis=0), files  # (N, C, H, W, L)
+
+
+def load_latent_stats(stats_path: str | Path) -> tuple[float, float]:
+    """Load mean and std saved by train_vqvae.py."""
+    data = np.load(str(stats_path))
+    return float(data["mean"]), float(data["std"])
 
 
 # ---------------------------------------------------------------------------
@@ -76,30 +83,46 @@ def train(config_path: str, vqvae_ckpt: str | None = None) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(ckpt_dir / "tb_logs"))
 
-    # Load latents
-    ds = load_latent_dataset(diff_cfg.latent_dir)
+    # Load raw latents
+    all_lats, _ = load_latents(diff_cfg.latent_dir)
+    print(f"Loaded {len(all_lats)} latents of shape {all_lats[0].shape}")
+
+    # Normalize to ~N(0,1) — diffusion models train better on normalized inputs
+    stats_path = getattr(diff_cfg, "latent_stats_path", None)
+    if stats_path and Path(stats_path).exists():
+        lat_mean, lat_std = load_latent_stats(stats_path)
+        print(f"Loaded latent stats from {stats_path}: mean={lat_mean:.4f}, std={lat_std:.4f}")
+    else:
+        lat_mean = float(all_lats.mean())
+        lat_std = float(all_lats.std())
+        print(f"Computed latent stats inline: mean={lat_mean:.4f}, std={lat_std:.4f}")
+
+    all_lats_norm = (all_lats - lat_mean) / (lat_std + 1e-8)
+    print(f"Normalized stats: mean={all_lats_norm.mean():.4f}, std={all_lats_norm.std():.4f}")
+
+    ds = TensorDataset(torch.from_numpy(all_lats_norm).float())
     loader = DataLoader(
         ds,
         batch_size=config.training.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
     )
-    sample_latent = ds[0][0]  # (C, H, W, L)
-    in_channels = sample_latent.shape[0]
-    print(f"Loaded {len(ds)} latents of shape {tuple(sample_latent.shape)}")
 
-    # Diffusion + UNet
+    # Auto-detect latent channel count from the data
+    in_channels = all_lats.shape[1]
+    print(f"Latent channels: {in_channels}")
+
     ddpm = DDPM(timesteps=diff_cfg.timesteps).to(device)
     unet = UNet3D(in_channels=in_channels).to(device)
     optimizer = torch.optim.AdamW(unet.parameters(), lr=diff_cfg.lr)
-    scaler = GradScaler(enabled=config.training.mixed_precision)
+    scaler = GradScaler("cuda", enabled=config.training.mixed_precision)
 
     global_step = 0
     latest_ckpt = ckpt_dir / "latest.pt"
     if latest_ckpt.exists():
-        state = torch.load(str(latest_ckpt), map_location=device)
+        state = torch.load(str(latest_ckpt), map_location=device, weights_only=False)
         unet.load_state_dict(state["unet"])
         optimizer.load_state_dict(state["optimizer"])
         scaler.load_state_dict(state["scaler"])
@@ -119,7 +142,7 @@ def train(config_path: str, vqvae_ckpt: str | None = None) -> None:
         x0 = x0.to(device, non_blocking=True).float()
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=config.training.mixed_precision):
+        with autocast("cuda", enabled=config.training.mixed_precision):
             loss = ddpm.p_loss(unet, x0)
 
         scaler.scale(loss).backward()
@@ -132,12 +155,13 @@ def train(config_path: str, vqvae_ckpt: str | None = None) -> None:
 
         if global_step % 100 == 0:
             elapsed = time.time() - t0
-            vram_mb = torch.cuda.max_memory_allocated(device) / 1e6 if device.type == "cuda" else 0
+            vram_gb = torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else 0
             print(
                 f"step {global_step:6d} | loss {loss.item():.6f} | "
-                f"VRAM {vram_mb:.0f}MB | {elapsed:.0f}s"
+                f"VRAM {vram_gb:.2f}GB | {elapsed:.0f}s"
             )
-            writer.add_scalar("diffusion/loss", loss.item(), global_step)
+            writer.add_scalar("diffusion/loss",        loss.item(),  global_step)
+            writer.add_scalar("diffusion/peak_vram_gb", vram_gb,     global_step)
 
         if global_step % diff_cfg.save_every == 0:
             state = {
@@ -145,6 +169,9 @@ def train(config_path: str, vqvae_ckpt: str | None = None) -> None:
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "step": global_step,
+                "in_channels": in_channels,
+                "lat_mean": lat_mean,
+                "lat_std": lat_std,
             }
             torch.save(state, str(ckpt_dir / "latest.pt"))
             torch.save(state, str(ckpt_dir / f"step_{global_step:06d}.pt"))
@@ -153,9 +180,8 @@ def train(config_path: str, vqvae_ckpt: str | None = None) -> None:
     writer.close()
     print("Diffusion training complete.")
 
-    # Quick inference demo (requires VQ-VAE decoder)
     if vqvae_ckpt:
-        _inference_demo(config, ddpm, unet, device, vqvae_ckpt, diff_cfg)
+        _inference_demo(config, ddpm, unet, device, vqvae_ckpt, diff_cfg, lat_mean, lat_std)
 
 
 def _inference_demo(
@@ -165,16 +191,12 @@ def _inference_demo(
     device: torch.device,
     vqvae_ckpt: str,
     diff_cfg: SimpleNamespace,
+    lat_mean: float,
+    lat_std: float,
 ) -> None:
-    """Sample 4 latents, decode through VQ-VAE, save as .npy TSDF."""
-    try:
-        from skimage.measure import marching_cubes
-    except ImportError:
-        print("scikit-image not installed; skipping mesh extraction demo.")
-        return
-
+    """Sample 4 latents, denormalize, decode through VQ-VAE, save as .npy TSDF."""
     vqvae = VQVAE(config).to(device)
-    vqvae.load_state_dict(torch.load(vqvae_ckpt, map_location=device))
+    vqvae.load_state_dict(torch.load(vqvae_ckpt, map_location=device, weights_only=False))
     vqvae.eval()
 
     sampler = DDIMSampler(ddpm, ddim_steps=diff_cfg.ddim_steps)
@@ -186,14 +208,20 @@ def _inference_demo(
     shape = (4, c, h, w, l)
 
     print(f"Sampling {shape[0]} latents via DDIM ({diff_cfg.ddim_steps} steps)...")
+    t0 = time.time()
     unet.eval()
     z_sampled = sampler.sample(unet, shape, device)
+    # Denormalize before decoding
+    z_sampled = z_sampled * lat_std + lat_mean
 
     out_dir = Path("outputs") / config.representation
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
-        tsdf_batch = vqvae.decode_latent(z_sampled)  # (B, 1, 32, 32, 32)
+        tsdf_batch = vqvae.decode_latent(z_sampled)
+
+    inf_time = (time.time() - t0) / shape[0]
+    print(f"Inference time per shape: {inf_time:.2f}s")
 
     for i in range(tsdf_batch.shape[0]):
         tsdf = tsdf_batch[i, 0].cpu().numpy()
