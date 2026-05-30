@@ -7,13 +7,13 @@ Walks data/raw/ for .obj files, saves:
 Then generates 80/10/10 train/val/test splits in data/splits/.
 
 Usage:
-    python scripts/prepare_data.py --data_root data/ --resolution 64 --truncation 3.0 --workers 8
+    python scripts/prepare_data.py --data_root data/ --resolution 64 --truncation 3.0 --workers 16
 """
 
 import argparse
+import multiprocessing as mp
 import random
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -30,8 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int,   default=64)
     parser.add_argument("--truncation", type=float, default=3.0)
     parser.add_argument("--seed",       type=int,   default=42)
-    parser.add_argument("--workers",    type=int,   default=8,
-                        help="Number of parallel CPU workers. Check nproc on your server.")
+    parser.add_argument("--workers",    type=int,   default=16,
+                        help="Number of parallel CPU workers.")
+    parser.add_argument("--timeout",    type=int,   default=120,
+                        help="Max seconds per mesh before skipping it.")
     return parser.parse_args()
 
 
@@ -41,22 +43,22 @@ def write_split(path: Path, ids: list[str]) -> None:
 
 
 def _process_one(args: tuple) -> tuple[str, str | None]:
-    """Worker function: voxelize one mesh and compute its TSDF.
+    """Worker: voxelize one mesh and compute its TSDF.
 
-    Returns (shape_id, error_message_or_None).
+    Returns (shape_id, None) on success or (shape_id, error_str) on failure.
+    Skips silently if output already exists.
     """
-    obj_path, voxel_path, tsdf_path, resolution, truncation = args
+    obj_path, voxel_path, tsdf_path, resolution, truncation, shape_id = args
 
-    # Skip if already processed (allows resuming interrupted runs)
     if Path(tsdf_path).exists():
-        return (Path(obj_path).stem, None)
+        return (shape_id, None)
 
     try:
         voxel = voxelize_and_save(obj_path, voxel_path, resolution)
         compute_and_save_tsdf(voxel, tsdf_path, truncation)
-        return (Path(obj_path).stem, None)
+        return (shape_id, None)
     except Exception as exc:
-        return (Path(obj_path).stem, str(exc))
+        return (shape_id, str(exc))
 
 
 def main() -> None:
@@ -74,50 +76,56 @@ def main() -> None:
 
     obj_files = sorted(raw_dir.rglob("*.obj"))
     if not obj_files:
-        print(f"No .obj files found under {raw_dir}. Place ShapeNet meshes there first.")
+        print(f"No .obj files found under {raw_dir}.")
         return
 
-    print(f"Found {len(obj_files)} meshes. Processing at {res}³ with {args.workers} workers...")
+    print(f"Found {len(obj_files)} meshes — {res}³, {args.workers} workers, {args.timeout}s timeout")
 
-    # Build task list
     tasks = []
-    shape_id_map: dict[str, str] = {}   # shape_id → full flattened key
     for obj_path in obj_files:
-        shape_id = str(obj_path.relative_to(raw_dir).with_suffix("")).replace("/", "__")
+        shape_id   = str(obj_path.relative_to(raw_dir).with_suffix("")).replace("/", "__")
         voxel_path = str(voxel_dir / f"{shape_id}.npy")
         tsdf_path  = str(tsdf_dir  / f"{shape_id}.npy")
-        tasks.append((str(obj_path), voxel_path, tsdf_path, res, args.truncation))
-        shape_id_map[obj_path.stem] = shape_id
+        tasks.append((str(obj_path), voxel_path, tsdf_path, res, args.truncation, shape_id))
 
     shape_ids: list[str] = []
-    failed: list[str] = []
+    failed:    list[tuple[str, str]] = []
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(_process_one, t): t for t in tasks}
+    # maxtasksperchild restarts each worker every N tasks — limits memory buildup
+    # and contains crashes to one worker rather than the whole pool
+    with mp.Pool(processes=args.workers, maxtasksperchild=20) as pool:
+        async_results = [
+            (task[5], pool.apply_async(_process_one, (task,)))
+            for task in tasks
+        ]
+
         with tqdm(total=len(tasks), desc=f"Preprocessing {res}³") as pbar:
-            for future in as_completed(futures):
-                task = futures[future]
-                tsdf_path = task[2]
-                shape_id = Path(tsdf_path).stem
-
+            for shape_id, result in async_results:
                 try:
-                    _, err = future.result()
+                    sid, err = result.get(timeout=args.timeout)
                     if err is None:
-                        shape_ids.append(shape_id)
+                        shape_ids.append(sid)
                     else:
-                        failed.append(f"{shape_id}: {err}")
+                        failed.append((sid, err))
+                except mp.TimeoutError:
+                    failed.append((shape_id, f"timeout >{args.timeout}s"))
                 except Exception as exc:
-                    failed.append(f"{shape_id}: worker crashed — {exc}")
+                    failed.append((shape_id, str(exc)))
                 pbar.update(1)
 
+    print(f"\nSucceeded: {len(shape_ids)}  Failed: {len(failed)}")
+
     if failed:
-        print(f"\nFailed ({len(failed)}):")
-        for f in failed[:10]:
-            print(f"  {f}")
+        print(f"\nFailed meshes ({len(failed)}):")
+        for sid, err in failed[:10]:
+            print(f"  {sid}: {err}")
         if len(failed) > 10:
             print(f"  ... and {len(failed)-10} more")
 
-    print(f"\nSucceeded: {len(shape_ids)}  Failed: {len(failed)}")
+        # Save failed IDs so you can inspect them
+        fail_log = data_root / "failed_meshes.txt"
+        fail_log.write_text("\n".join(f"{s}\t{e}" for s, e in failed) + "\n")
+        print(f"\nFull failure list saved to {fail_log}")
 
     if not shape_ids:
         print("No shapes successfully processed.")
@@ -126,7 +134,7 @@ def main() -> None:
     # 80/10/10 split
     random.seed(args.seed)
     random.shuffle(shape_ids)
-    n = len(shape_ids)
+    n       = len(shape_ids)
     n_train = int(0.8 * n)
     n_val   = int(0.1 * n)
 
