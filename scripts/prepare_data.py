@@ -7,12 +7,13 @@ Walks data/raw/ for .obj files, saves:
 Then generates 80/10/10 train/val/test splits in data/splits/.
 
 Usage:
-    python scripts/prepare_data.py --data_root data/ --resolution 64 --truncation 3.0
+    python scripts/prepare_data.py --data_root data/ --resolution 64 --truncation 3.0 --workers 8
 """
 
 import argparse
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -29,12 +30,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int,   default=64)
     parser.add_argument("--truncation", type=float, default=3.0)
     parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--workers",    type=int,   default=8,
+                        help="Number of parallel CPU workers. Check nproc on your server.")
     return parser.parse_args()
 
 
 def write_split(path: Path, ids: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(ids) + "\n")
+
+
+def _process_one(args: tuple) -> tuple[str, str | None]:
+    """Worker function: voxelize one mesh and compute its TSDF.
+
+    Returns (shape_id, error_message_or_None).
+    """
+    obj_path, voxel_path, tsdf_path, resolution, truncation = args
+
+    # Skip if already processed (allows resuming interrupted runs)
+    if Path(tsdf_path).exists():
+        return (Path(obj_path).stem, None)
+
+    try:
+        voxel = voxelize_and_save(obj_path, voxel_path, resolution)
+        compute_and_save_tsdf(voxel, tsdf_path, truncation)
+        return (Path(obj_path).stem, None)
+    except Exception as exc:
+        return (Path(obj_path).stem, str(exc))
 
 
 def main() -> None:
@@ -55,23 +77,49 @@ def main() -> None:
         print(f"No .obj files found under {raw_dir}. Place ShapeNet meshes there first.")
         return
 
-    print(f"Found {len(obj_files)} meshes. Processing at {res}³...")
-    shape_ids: list[str] = []
+    print(f"Found {len(obj_files)} meshes. Processing at {res}³ with {args.workers} workers...")
 
-    for obj_path in tqdm(obj_files, desc="Preprocessing"):
-        # Flatten subdirectory structure into the shape ID
+    # Build task list
+    tasks = []
+    shape_id_map: dict[str, str] = {}   # shape_id → full flattened key
+    for obj_path in obj_files:
         shape_id = str(obj_path.relative_to(raw_dir).with_suffix("")).replace("/", "__")
-        shape_ids.append(shape_id)
+        voxel_path = str(voxel_dir / f"{shape_id}.npy")
+        tsdf_path  = str(tsdf_dir  / f"{shape_id}.npy")
+        tasks.append((str(obj_path), voxel_path, tsdf_path, res, args.truncation))
+        shape_id_map[obj_path.stem] = shape_id
 
-        voxel_path = voxel_dir / f"{shape_id}.npy"
-        tsdf_path  = tsdf_dir  / f"{shape_id}.npy"
+    shape_ids: list[str] = []
+    failed: list[str] = []
 
-        try:
-            voxel = voxelize_and_save(obj_path, voxel_path, args.resolution)
-            compute_and_save_tsdf(voxel, tsdf_path, args.truncation)
-        except Exception as exc:
-            print(f"\n  WARNING: failed to process {obj_path}: {exc}")
-            shape_ids.pop()
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(_process_one, t): t for t in tasks}
+        with tqdm(total=len(tasks), desc=f"Preprocessing {res}³") as pbar:
+            for future in as_completed(futures):
+                task = futures[future]
+                obj_path = task[0]
+                full_shape_id = str(
+                    Path(obj_path).relative_to(raw_dir).with_suffix("")
+                ).replace("/", "__") if "/" in obj_path else Path(obj_path).stem
+                # Reconstruct shape_id from the task's paths
+                tsdf_path = task[2]
+                shape_id = Path(tsdf_path).stem
+
+                _, err = future.result()
+                if err is None:
+                    shape_ids.append(shape_id)
+                else:
+                    failed.append(f"{shape_id}: {err}")
+                pbar.update(1)
+
+    if failed:
+        print(f"\nFailed ({len(failed)}):")
+        for f in failed[:10]:
+            print(f"  {f}")
+        if len(failed) > 10:
+            print(f"  ... and {len(failed)-10} more")
+
+    print(f"\nSucceeded: {len(shape_ids)}  Failed: {len(failed)}")
 
     if not shape_ids:
         print("No shapes successfully processed.")
@@ -92,7 +140,7 @@ def main() -> None:
     write_split(splits_dir / "val.txt",   val_ids)
     write_split(splits_dir / "test.txt",  test_ids)
 
-    print(f"\nDone. {len(train_ids)} train / {len(val_ids)} val / {len(test_ids)} test")
+    print(f"{len(train_ids)} train / {len(val_ids)} val / {len(test_ids)} test")
     print(f"Voxel dir : {voxel_dir}/")
     print(f"TSDF dir  : {tsdf_dir}/")
     print(f"Splits    : {splits_dir}/")
