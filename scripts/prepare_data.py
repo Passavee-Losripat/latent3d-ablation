@@ -97,19 +97,17 @@ def main() -> None:
         with tqdm(total=len(tasks), desc=f"Preprocessing {res}³") as pbar:
             for future in as_completed(futures):
                 task = futures[future]
-                obj_path = task[0]
-                full_shape_id = str(
-                    Path(obj_path).relative_to(raw_dir).with_suffix("")
-                ).replace("/", "__") if "/" in obj_path else Path(obj_path).stem
-                # Reconstruct shape_id from the task's paths
                 tsdf_path = task[2]
                 shape_id = Path(tsdf_path).stem
 
-                _, err = future.result()
-                if err is None:
-                    shape_ids.append(shape_id)
-                else:
-                    failed.append(f"{shape_id}: {err}")
+                try:
+                    _, err = future.result()
+                    if err is None:
+                        shape_ids.append(shape_id)
+                    else:
+                        failed.append(f"{shape_id}: {err}")
+                except Exception as exc:
+                    failed.append(f"{shape_id}: worker crashed — {exc}")
                 pbar.update(1)
 
     if failed:
