@@ -62,12 +62,14 @@ def reconstruction_loss(
     surface_weight: float = 10.0,
     surface_threshold: float = 0.3,
 ) -> torch.Tensor:
-    """Surface-weighted reconstruction loss.
+    """Reconstruction loss, optionally surface-weighted.
 
-    Near-surface voxels (|tsdf| < surface_threshold) receive `surface_weight`×
-    the loss of empty-space voxels. This focuses training on the surface geometry
-    where reconstruction quality matters most.
+    For TSDF (l1/l2): near-surface voxels (|tsdf| < surface_threshold) are
+    weighted surface_weight× more heavily than empty-space voxels.
+    For occupancy (bce): standard binary cross-entropy, no spatial weighting.
     """
+    if mode == "bce":
+        return F.binary_cross_entropy(pred, target.float())
     if mode == "l1":
         per_voxel = F.l1_loss(pred, target, reduction="none")
     elif mode in ("l2", "mse"):
@@ -75,7 +77,6 @@ def reconstruction_loss(
     else:
         raise ValueError(f"Unknown reconstruction loss: {mode}")
 
-    # Weight near-surface voxels more heavily
     near_surface = (target.abs() < surface_threshold).float()
     weight = 1.0 + (surface_weight - 1.0) * near_surface
     return (per_voxel * weight).mean()

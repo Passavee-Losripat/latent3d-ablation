@@ -1,0 +1,50 @@
+representation: occupancy
+
+data:
+  root: data/
+  processed_dir: data/processed/voxel_64/   # binary voxel grids — already exists from preprocessing
+  voxel_dir: data/processed/voxel_64/
+  splits_dir: data/splits/
+  augment: true
+
+model:
+  encoder_dim: 256
+  codebook_size: 512
+  latent_channels: 64
+  decoder: occupancy
+  resolution: 64
+
+training:
+  batch_size: 16
+  num_steps: 50000
+  lr: 1.0e-4
+  lr_schedule: cosine
+  warmup_steps: 1000
+  mixed_precision: true
+  grad_checkpoint: false
+  save_every: 5000
+  checkpoint_dir: checkpoints/occupancy/
+
+loss:
+  reconstruction: bce       # binary cross-entropy for inside/outside labels
+  surface_weight: 1.0       # no surface weighting — BCE handles it uniformly
+  surface_threshold: 0.3    # unused for bce but kept for config consistency
+  vq_weight: 0.0
+  commitment_weight: 0.25
+
+evaluation:
+  metrics: [chamfer, iou, fscore, mmd, coverage, jsd]
+  fscore_threshold: 0.01
+  iso_threshold: 0.5        # occupancy surface at p=0.5 (not 0.0 like TSDF)
+  n_generate: 100
+  n_points: 2048
+
+diffusion:
+  latent_dir: data/latents/occupancy/
+  latent_stats_path: checkpoints/occupancy/latent_stats.npz
+  checkpoint_dir: checkpoints/occupancy_diffusion/
+  timesteps: 1000
+  num_steps: 100000
+  lr: 2.0e-4
+  save_every: 10000
+  ddim_steps: 50

@@ -6,14 +6,14 @@ No other files need to change.
 
 from typing import Any
 
-from models.decoders.tsdf_decoder import TSDFDecoder
-# from models.decoders.occupancy_decoder import OccupancyDecoder  ← add here
-# from models.decoders.triplane_decoder import TriplaneDecoder    ← add here
+from models.decoders.tsdf_decoder       import TSDFDecoder
+from models.decoders.occupancy_decoder  import OccupancyDecoder
+from models.decoders.triplane_decoder   import TriplaneDecoder
 
 DECODER_REGISTRY: dict[str, type] = {
-    "tsdf": TSDFDecoder,
-    # "occupancy": OccupancyDecoder,
-    # "triplane": TriplaneDecoder,
+    "tsdf":       TSDFDecoder,
+    "occupancy":  OccupancyDecoder,
+    "triplane":   TriplaneDecoder,
 }
 
 

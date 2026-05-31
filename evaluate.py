@@ -105,8 +105,15 @@ def iou_from_tsdf(
     gt_voxel: np.ndarray,
     threshold: float = 0.0,
 ) -> float:
-    """Binary IoU: threshold predicted TSDF at 0 → compare with GT binary voxel."""
-    pred_bin = (pred_tsdf <= threshold).astype(np.float32)
+    """Binary IoU: threshold prediction → compare with GT binary voxel.
+
+    For TSDF/triplane (threshold=0.0): inside where pred <= 0.
+    For occupancy (threshold=0.5):     inside where pred >= 0.5.
+    """
+    if threshold == 0.5:
+        pred_bin = (pred_tsdf >= threshold).astype(np.float32)
+    else:
+        pred_bin = (pred_tsdf <= threshold).astype(np.float32)
     gt_bin   = (gt_voxel  >  0).astype(np.float32)
     intersection = (pred_bin * gt_bin).sum()
     union        = ((pred_bin + gt_bin) > 0).sum()
@@ -217,6 +224,7 @@ def evaluate_stage1(
 
     chamfers, ious, fscores = [], [], []
     mixed = config.training.mixed_precision
+    iso_threshold = getattr(config.evaluation, "iso_threshold", 0.0)
 
     for x, (shape_id,) in loader:
         x = x.to(device)
@@ -225,8 +233,8 @@ def evaluate_stage1(
         pred_tsdf = out.reconstruction[0, 0].cpu().float().numpy()
         gt_tsdf   = x[0, 0].cpu().float().numpy()
 
-        pred_pc = tsdf_to_pointcloud(pred_tsdf)
-        gt_pc   = tsdf_to_pointcloud(gt_tsdf)
+        pred_pc = tsdf_to_pointcloud(pred_tsdf, threshold=iso_threshold)
+        gt_pc   = tsdf_to_pointcloud(gt_tsdf,   threshold=iso_threshold)
         if pred_pc is not None and gt_pc is not None and len(pred_pc) > 0 and len(gt_pc) > 0:
             p = sample_point_cloud(pred_pc, n_points)
             g = sample_point_cloud(gt_pc,   n_points)
@@ -237,7 +245,7 @@ def evaluate_stage1(
         vox_path = voxel_dir / f"{shape_id}.npy"
         if vox_path.exists():
             gt_voxel = np.load(str(vox_path))
-            ious.append(iou_from_tsdf(pred_tsdf, gt_voxel))
+            ious.append(iou_from_tsdf(pred_tsdf, gt_voxel, threshold=iso_threshold))
 
     return {
         "chamfer_distance":  float(np.mean(chamfers)) if chamfers else float("nan"),
@@ -357,10 +365,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # Read training profiling stats stored inside the VQ-VAE checkpoint
+    # Read training profiling stats — best.pt only has weights, so also try latest.pt
     vqvae_state = torch.load(args.vqvae_ckpt, map_location="cpu", weights_only=False)
     avg_epoch_time_s = vqvae_state.get("avg_epoch_time_s", None)
     ckpt_peak_vram   = vqvae_state.get("peak_vram_gb",     None)
+    if avg_epoch_time_s is None:
+        latest = Path(args.vqvae_ckpt).parent / "latest.pt"
+        if latest.exists():
+            s = torch.load(str(latest), map_location="cpu", weights_only=False)
+            avg_epoch_time_s = s.get("avg_epoch_time_s", None)
+            ckpt_peak_vram   = s.get("peak_vram_gb", ckpt_peak_vram)
 
     if args.stage in ("1", "both"):
         print("─" * 50)
