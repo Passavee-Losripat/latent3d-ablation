@@ -69,7 +69,7 @@ def reconstruction_loss(
     For occupancy (bce): standard binary cross-entropy, no spatial weighting.
     """
     if mode == "bce":
-        return F.binary_cross_entropy(pred, target.float())
+        return F.binary_cross_entropy_with_logits(pred, target.float())
     if mode == "l1":
         per_voxel = F.l1_loss(pred, target, reduction="none")
     elif mode in ("l2", "mse"):

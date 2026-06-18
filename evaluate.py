@@ -230,7 +230,11 @@ def evaluate_stage1(
         x = x.to(device)
         with torch.no_grad(), autocast("cuda", enabled=mixed):
             out = vqvae(x)
-        pred_tsdf = out.reconstruction[0, 0].cpu().float().numpy()
+        pred_raw = out.reconstruction[0, 0].cpu().float()
+        # Occupancy decoder outputs logits — apply sigmoid before iso-surface extraction
+        if iso_threshold == 0.5:
+            pred_raw = torch.sigmoid(pred_raw)
+        pred_tsdf = pred_raw.numpy()
         gt_tsdf   = x[0, 0].cpu().float().numpy()
 
         pred_pc = tsdf_to_pointcloud(pred_tsdf, threshold=iso_threshold)

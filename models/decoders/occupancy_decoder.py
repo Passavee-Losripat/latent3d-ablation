@@ -29,7 +29,9 @@ class OccupancyDecoder(nn.Module):
 
         self.head = nn.Sequential(
             nn.Conv3d(32, 1, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid(),   # output in [0, 1] — inside probability
+            # No sigmoid here — output is raw logits.
+            # sigmoid is applied at inference; during training we use
+            # F.binary_cross_entropy_with_logits which is autocast-safe.
         )
 
     def forward(self, z_q: torch.Tensor) -> torch.Tensor:
