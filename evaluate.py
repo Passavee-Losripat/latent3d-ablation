@@ -310,9 +310,10 @@ def evaluate_stage2(
     )
     n_points_eval = getattr(config.evaluation, "n_points", n_points)
     ref_pcs: list[np.ndarray] = []
+    iso_threshold = getattr(config.evaluation, "iso_threshold", 0.0)
     for i in range(min(len(test_ds), 200)):
         x, _ = test_ds[i]
-        pc = tsdf_to_pointcloud(x[0].numpy())
+        pc = tsdf_to_pointcloud(x[0].numpy(), threshold=iso_threshold)
         if pc is not None and len(pc) > 0:
             ref_pcs.append(sample_point_cloud(pc, n_points_eval))
 
@@ -330,8 +331,11 @@ def evaluate_stage2(
         with torch.no_grad(), autocast("cuda", enabled=mixed):
             tsdf_batch = vqvae.decode_latent(z)
         for i in range(bs):
-            tsdf = tsdf_batch[i, 0].cpu().float().numpy()
-            pc   = tsdf_to_pointcloud(tsdf)
+            raw = tsdf_batch[i, 0].cpu().float()
+            # Occupancy decoder outputs logits — apply sigmoid before marching cubes
+            if iso_threshold == 0.5:
+                raw = torch.sigmoid(raw)
+            pc = tsdf_to_pointcloud(raw.numpy(), threshold=iso_threshold)
             if pc is not None and len(pc) > 0:
                 gen_pcs.append(sample_point_cloud(pc, n_points_eval))
 
